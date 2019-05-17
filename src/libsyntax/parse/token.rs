@@ -122,9 +122,9 @@ pub(crate) fn ident_can_begin_expr(ident: ast::Ident, is_raw: bool) -> bool {
         keywords::Continue.name(),
         keywords::False.name(),
         keywords::For.name(),
+        keywords::If.name(),
         // FIXME(53667): Consider whether `Let` can be added here.
         // keywords::Let.name(),
-        keywords::If.name(),
         keywords::Loop.name(),
         keywords::Match.name(),
         keywords::Move.name(),
