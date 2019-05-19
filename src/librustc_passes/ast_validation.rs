@@ -16,13 +16,11 @@ use syntax::ast::*;
 use syntax::attr;
 use syntax::source_map::Spanned;
 use syntax::symbol::{keywords, sym};
-use syntax::ptr::P;
 use syntax::visit::{self, Visitor};
 use syntax::{span_err, struct_span_err, walk_list};
 use syntax_ext::proc_macro_decls::is_proc_macro_attr;
 use syntax_pos::{Span, MultiSpan};
 use errors::{Applicability, FatalError};
-use log::debug;
 
 #[derive(Copy, Clone, Debug)]
 struct OuterImplTrait {
@@ -71,26 +69,44 @@ struct AstValidator<'a> {
     /// these booleans.
     warning_period_57979_didnt_record_next_impl_trait: bool,
     warning_period_57979_impl_trait_in_proj: bool,
+
+    /// Used to ban `let` expressions in inappropriate places.
+    is_let_allowed: bool,
+}
+
+/// With the `new` value in `store`,
+/// runs and returns the `scoped` computation,
+/// resetting the old value of `store` after,
+/// and returning the result of `scoped`.
+fn with<C, T, S>(
+    this: &mut C,
+    new: S,
+    store: impl Fn(&mut C) -> &mut S,
+    scoped: impl FnOnce(&mut C) -> T
+) -> T {
+    let old = mem::replace(store(this), new);
+    let ret = scoped(this);
+    *store(this) = old;
+    ret
 }
 
 impl<'a> AstValidator<'a> {
     fn with_impl_trait_in_proj_warning<T>(&mut self, v: bool, f: impl FnOnce(&mut Self) -> T) -> T {
-        let old = mem::replace(&mut self.warning_period_57979_impl_trait_in_proj, v);
-        let ret = f(self);
-        self.warning_period_57979_impl_trait_in_proj = old;
-        ret
+        with(self, v, |this| &mut this.warning_period_57979_impl_trait_in_proj, f)
     }
 
     fn with_banned_impl_trait(&mut self, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_impl_trait_banned, true);
-        f(self);
-        self.is_impl_trait_banned = old;
+        with(self, true, |this| &mut this.is_impl_trait_banned, f)
     }
 
     fn with_impl_trait(&mut self, outer: Option<OuterImplTrait>, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.outer_impl_trait, outer);
-        f(self);
-        self.outer_impl_trait = old;
+        with(self, outer, |this| &mut this.outer_impl_trait, f)
+    }
+
+    fn with_let_allowed(&mut self, v: bool, f: impl FnOnce(&mut Self, bool)) {
+        let old = mem::replace(&mut self.is_let_allowed, v);
+        f(self, old);
+        self.is_let_allowed = old;
     }
 
     fn visit_assoc_type_binding_from_generic_args(&mut self, type_binding: &'a TypeBinding) {
@@ -297,52 +313,71 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    /// With eRFC 2497, we need to check whether an expression is ambiguous and warn or error
-    /// depending on the edition, this function handles that.
-    fn while_if_let_ambiguity(&self, expr: &P<Expr>) {
-        if let Some((span, op_kind)) = self.while_if_let_expr_ambiguity(&expr) {
-            let mut err = self.err_handler().struct_span_err(
-                span, &format!("ambiguous use of `{}`", op_kind.to_string())
-            );
-
-            err.note(
-                "this will be a error until the `let_chains` feature is stabilized"
-            );
-            err.note(
-                "see rust-lang/rust#53668 for more information"
-            );
-
-            if let Ok(snippet) = self.session.source_map().span_to_snippet(span) {
+    fn obsolete_in_place(&self, expr: &Expr, place: &Expr, val: &Expr) {
+        let mut err = self.err_handler().struct_span_err(
+            expr.span,
+            "emplacement syntax is obsolete (for now, anyway)",
+        );
+        err.note(
+            "for more information, see \
+                <https://github.com/rust-lang/rust/issues/27779#issuecomment-378416911>"
+        );
+        match val.node {
+            ExprKind::Lit(ref v) if v.node.is_numeric() => {
                 err.span_suggestion(
-                    span, "consider adding parentheses", format!("({})", snippet),
-                    Applicability::MachineApplicable,
+                    place.span.between(val.span),
+                    "if you meant to write a comparison against a negative value, add a \
+                        space in between `<` and `-`",
+                    "< -".to_string(),
+                    Applicability::MaybeIncorrect
                 );
             }
-
-            err.emit();
+            _ => {}
         }
+        err.emit();
     }
 
-    /// With eRFC 2497 adding if-let chains, there is a requirement that the parsing of
-    /// `&&` and `||` in a if-let statement be unambiguous. This function returns a span and
-    /// a `BinOpKind` (either `&&` or `||` depending on what was ambiguous) if it is determined
-    /// that the current expression parsed is ambiguous and will break in future.
-    fn while_if_let_expr_ambiguity(&self, expr: &P<Expr>) -> Option<(Span, BinOpKind)> {
-        debug!("while_if_let_expr_ambiguity: expr.node: {:?}", expr.node);
+    /// Visits the `expr` and adjusts whether `let $pat = $expr` is allowed in decendants.
+    /// Returns whether we walked into `expr` or not.
+    /// If we did, walking should not happen again.
+    fn visit_expr_with_let_maybe_allowed(&mut self, expr: &'a Expr, let_allowed: bool) -> bool {
         match &expr.node {
-            ExprKind::Binary(op, _, _) if op.node == BinOpKind::And || op.node == BinOpKind::Or => {
-                Some((expr.span, op.node))
-            },
-            ExprKind::Range(ref lhs, ref rhs, _) => {
-                let lhs_ambiguous = lhs.as_ref()
-                    .and_then(|lhs| self.while_if_let_expr_ambiguity(lhs));
-                let rhs_ambiguous = rhs.as_ref()
-                    .and_then(|rhs| self.while_if_let_expr_ambiguity(rhs));
-
-                lhs_ambiguous.or(rhs_ambiguous)
+            // Assuming the context permits, `($expr)` does not impose additional constraints.
+            ExprKind::Paren(_) => {
+                self.with_let_allowed(let_allowed, |this, _| visit::walk_expr(this, expr));
             }
-            _ => None,
+            // Assuming the context permits,
+            // l && r` allows decendants in `l` and `r` to be `let` expressions.
+            ExprKind::Binary(op, ..) if op.node == BinOpKind::And => {
+                self.with_let_allowed(let_allowed, |this, _| visit::walk_expr(this, expr));
+            }
+            // However, we do allow it in the condition of the `if` expression.
+            // We do not allow `let` in `then` and `opt_else` directly.
+            ExprKind::If(cond, then, opt_else) => {
+                self.visit_block(then);
+                walk_list!(self, visit_expr, opt_else);
+                self.with_let_allowed(true, |this, _| this.visit_expr(cond));
+            }
+            // The same logic applies to `While`.
+            ExprKind::While(cond, then, opt_label) => {
+                walk_list!(self, visit_label, opt_label);
+                self.visit_block(then);
+                self.with_let_allowed(true, |this, _| this.visit_expr(cond));
+            }
+            // Don't walk into `expr` and defer further checks to the caller.
+            _ => return false,
         }
+
+        true
+    }
+
+    /// Emits an error banning the `let` expression provided.
+    fn ban_let_expr(&self, expr: &'a Expr) {
+        self.err_handler()
+            .struct_span_err(expr.span, "`let` expressions are not supported here")
+            .note("only supported directly in conditions of `if`- and `while`-expressions")
+            .note("as well as when nested within `&&` and parenthesis in those conditions")
+            .emit();
     }
 }
 
@@ -448,39 +483,26 @@ fn validate_generics_order<'a>(
 
 impl<'a> Visitor<'a> for AstValidator<'a> {
     fn visit_expr(&mut self, expr: &'a Expr) {
-        match expr.node {
-            ExprKind::IfLet(_, ref expr, _, _) | ExprKind::WhileLet(_, ref expr, _, _) =>
-                self.while_if_let_ambiguity(&expr),
-            ExprKind::InlineAsm(..) if !self.session.target.target.options.allow_asm => {
-                span_err!(self.session, expr.span, E0472, "asm! is unsupported on this target");
-            }
-            ExprKind::ObsoleteInPlace(ref place, ref val) => {
-                let mut err = self.err_handler().struct_span_err(
-                    expr.span,
-                    "emplacement syntax is obsolete (for now, anyway)",
-                );
-                err.note(
-                    "for more information, see \
-                     <https://github.com/rust-lang/rust/issues/27779#issuecomment-378416911>"
-                );
-                match val.node {
-                    ExprKind::Lit(ref v) if v.node.is_numeric() => {
-                        err.span_suggestion(
-                            place.span.between(val.span),
-                            "if you meant to write a comparison against a negative value, add a \
-                             space in between `<` and `-`",
-                            "< -".to_string(),
-                            Applicability::MaybeIncorrect
-                        );
-                    }
-                    _ => {}
+        self.with_let_allowed(false, |this, let_allowed| {
+            match &expr.node {
+                ExprKind::Let(_, _) if !let_allowed => {
+                    this.ban_let_expr(expr);
                 }
-                err.emit();
+                _ if this.visit_expr_with_let_maybe_allowed(&expr, let_allowed) => {
+                    // Prevent `walk_expr` to happen since we've already done that.
+                    return;
+                }
+                ExprKind::InlineAsm(..) if !this.session.target.target.options.allow_asm => {
+                    span_err!(this.session, expr.span, E0472, "asm! is unsupported on this target");
+                }
+                ExprKind::ObsoleteInPlace(place, val) => {
+                    this.obsolete_in_place(expr, place, val);
+                }
+                _ => {}
             }
-            _ => {}
-        }
 
-        visit::walk_expr(self, expr)
+            visit::walk_expr(this, expr);
+        });
     }
 
     fn visit_ty(&mut self, ty: &'a Ty) {
@@ -862,6 +884,7 @@ pub fn check_crate(session: &Session, krate: &Crate) -> (bool, bool) {
         is_impl_trait_banned: false,
         warning_period_57979_didnt_record_next_impl_trait: false,
         warning_period_57979_impl_trait_in_proj: false,
+        is_let_allowed: false,
     };
     visit::walk_crate(&mut validator, krate);
 

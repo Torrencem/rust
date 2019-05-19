@@ -554,6 +554,9 @@ declare_features! (
     // Allows using C-variadics.
     (active, c_variadic, "1.34.0", Some(44930), None),
 
+    // Allows `if/while p && let q = r && ...` chains.
+    (active, let_chains, "1.36.0", Some(53667), None),
+
     // -------------------------------------------------------------------------
     // feature-group-end: actual feature gates
     // -------------------------------------------------------------------------
@@ -565,7 +568,8 @@ declare_features! (
 const INCOMPLETE_FEATURES: &[Symbol] = &[
     sym::impl_trait_in_bindings,
     sym::generic_associated_types,
-    sym::const_generics
+    sym::const_generics,
+    sym::let_chains,
 ];
 
 declare_features! (
@@ -1884,6 +1888,27 @@ impl<'a> PostExpansionVisitor<'a> {
             Err(mut err) => err.emit(),
         }
     }
+
+    /// Recurse into all places where a `let` expression would be feature gated
+    /// and emit gate post errors for those.
+    fn find_and_gate_lets(&mut self, e: &'a ast::Expr) {
+        match &e.node {
+            ast::ExprKind::Paren(e) => {
+                self.find_and_gate_lets(e);
+            }
+            ast::ExprKind::Binary(op, lhs, rhs) if op.node == ast::BinOpKind::And => {
+                self.find_and_gate_lets(lhs);
+                self.find_and_gate_lets(rhs);
+            }
+            ast::ExprKind::Let(..) => {
+                gate_feature_post!(
+                    &self, let_chains, e.span,
+                    "`let` expressions in this position are experimental"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
@@ -2099,6 +2124,10 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_expr(&mut self, e: &'a ast::Expr) {
         match e.node {
+            ast::ExprKind::If(ref e, ..) | ast::ExprKind::While(ref e, ..) => match e.node {
+                ast::ExprKind::Let(..) => {} // Stable!,
+                _ => self.find_and_gate_lets(e),
+            }
             ast::ExprKind::Box(_) => {
                 gate_feature_post!(&self, box_syntax, e.span, EXPLAIN_BOX_SYNTAX);
             }

@@ -265,6 +265,7 @@ pub enum ExprPrecedence {
 
     Box,
     AddrOf,
+    Let,
     Unary,
 
     Call,
@@ -282,9 +283,7 @@ pub enum ExprPrecedence {
     Path,
     Paren,
     If,
-    IfLet,
     While,
-    WhileLet,
     ForLoop,
     Loop,
     Match,
@@ -324,6 +323,8 @@ impl ExprPrecedence {
             // Unary, prefix
             ExprPrecedence::Box |
             ExprPrecedence::AddrOf |
+            // Here `let pats = expr` has `let pats =` as a "unary" prefix of `expr`.
+            ExprPrecedence::Let |
             ExprPrecedence::Unary => PREC_PREFIX,
 
             // Unary, postfix
@@ -344,9 +345,7 @@ impl ExprPrecedence {
             ExprPrecedence::Path |
             ExprPrecedence::Paren |
             ExprPrecedence::If |
-            ExprPrecedence::IfLet |
             ExprPrecedence::While |
-            ExprPrecedence::WhileLet |
             ExprPrecedence::ForLoop |
             ExprPrecedence::Loop |
             ExprPrecedence::Match |
